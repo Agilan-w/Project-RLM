@@ -1,0 +1,14 @@
+# =============================================================================
+# Super Mario Bros Neuroevolution - Dependencies
+# =============================================================================
+# IMPORTANT: gym must be pinned to 0.25.2. Newer versions of Gym (>=0.26)
+# changed the step() return signature from 4-tuples to 5-tuples and broke
+# compatibility with the nes-py emulator backend.
+# =============================================================================
+
+gym==0.25.2
+gym-super-mario-bros
+nes-py
+numpy<2
+opencv-python  
+ 
