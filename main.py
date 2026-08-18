@@ -344,9 +344,9 @@ def run():
     env = make_env()
     ga = GeneticAlgorithm(population_size=100)
     
-    for generation in range(1, 5001):
+    for generation in range(1, 501):
         best_fitness = ga.evolve(env)
-        print(f"Generation {generation:4d} | Best Fitness (Max X-Pos): {best_fitness}")
+        print(f"Generation {generation:3d} | Best Fitness (Max X-Pos): {best_fitness}")
         
     env.close()
 
