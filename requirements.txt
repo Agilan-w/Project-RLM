@@ -10,5 +10,8 @@ gym==0.25.2
 gym-super-mario-bros
 nes-py
 numpy<2
-opencv-python  
- 
+opencv-python==4.10.0.84
+
+# CuPy for GPU Acceleration on NVIDIA GPUs
+# Note: This specifies the CUDA 12.x wheel. If you have CUDA 11.x, change this to cupy-cuda11x
+cupy-cuda12x

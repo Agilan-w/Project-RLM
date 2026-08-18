@@ -30,6 +30,8 @@ from nes_py.wrappers import JoypadSpace
 from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
 import cv2
 import numpy as np
+import cupy as cp
+import random
 
 
 # ── Environment Setup ────────────────────────────────────────────────────────
@@ -154,31 +156,34 @@ def extract_vision_grid(env):
 
 class NeuralNet:
     """
-    A simple pure-NumPy Feedforward Neural Network.
+    A simple pure-CuPy Feedforward Neural Network.
     No PyTorch, TensorFlow, or Keras.
     """
     def __init__(self, input_size=256, hidden_size=18, output_size=7):
         # Initialize weights and biases with random values between -1 and 1
-        self.weights1 = np.random.uniform(-1, 1, (input_size, hidden_size))
-        self.bias1 = np.random.uniform(-1, 1, hidden_size)
+        self.weights1 = cp.random.uniform(-1, 1, (input_size, hidden_size))
+        self.bias1 = cp.random.uniform(-1, 1, hidden_size)
         
-        self.weights2 = np.random.uniform(-1, 1, (hidden_size, output_size))
-        self.bias2 = np.random.uniform(-1, 1, output_size)
+        self.weights2 = cp.random.uniform(-1, 1, (hidden_size, output_size))
+        self.bias2 = cp.random.uniform(-1, 1, output_size)
         
     def relu(self, x):
         # ReLU activation function: max(0, x)
-        return np.maximum(0, x)
+        return cp.maximum(0, x)
         
     def predict(self, inputs):
+        # inputs is a numpy array from extract_vision_grid. Transfer to GPU.
+        inputs_gpu = cp.array(inputs)
+        
         # Forward pass through the hidden layer
-        z1 = np.dot(inputs, self.weights1) + self.bias1
+        z1 = cp.dot(inputs_gpu, self.weights1) + self.bias1
         a1 = self.relu(z1)
         
         # Forward pass through the output layer
-        z2 = np.dot(a1, self.weights2) + self.bias2
+        z2 = cp.dot(a1, self.weights2) + self.bias2
         
-        # Return the index (0-6) of the highest output score
-        return int(np.argmax(z2))
+        # Return the index (0-6) of the highest output score as a standard int
+        return int(cp.argmax(z2).get())
 
 
 # ── Genetic Algorithm (Phase 4) ──────────────────────────────────────────────
@@ -222,26 +227,26 @@ class GeneticAlgorithm:
         child = NeuralNet()
         
         # 50% chance to inherit from parent 1 or 2
-        mask_w1 = np.random.rand(*child.weights1.shape) > 0.5
-        child.weights1 = np.where(mask_w1, parent1.weights1, parent2.weights1)
+        mask_w1 = cp.random.rand(*child.weights1.shape) > 0.5
+        child.weights1 = cp.where(mask_w1, parent1.weights1, parent2.weights1)
         
-        mask_b1 = np.random.rand(*child.bias1.shape) > 0.5
-        child.bias1 = np.where(mask_b1, parent1.bias1, parent2.bias1)
+        mask_b1 = cp.random.rand(*child.bias1.shape) > 0.5
+        child.bias1 = cp.where(mask_b1, parent1.bias1, parent2.bias1)
         
-        mask_w2 = np.random.rand(*child.weights2.shape) > 0.5
-        child.weights2 = np.where(mask_w2, parent1.weights2, parent2.weights2)
+        mask_w2 = cp.random.rand(*child.weights2.shape) > 0.5
+        child.weights2 = cp.where(mask_w2, parent1.weights2, parent2.weights2)
         
-        mask_b2 = np.random.rand(*child.bias2.shape) > 0.5
-        child.bias2 = np.where(mask_b2, parent1.bias2, parent2.bias2)
+        mask_b2 = cp.random.rand(*child.bias2.shape) > 0.5
+        child.bias2 = cp.where(mask_b2, parent1.bias2, parent2.bias2)
         
         return child
         
     def mutate(self, network, mutation_rate=0.05):
         # 5% chance to multiply weight/bias by random factor between 0.5 and 1.5
         def apply_mutation(matrix):
-            mask = np.random.rand(*matrix.shape) < mutation_rate
-            scale = np.random.uniform(0.5, 1.5, matrix.shape)
-            return np.where(mask, matrix * scale, matrix)
+            mask = cp.random.rand(*matrix.shape) < mutation_rate
+            scale = cp.random.uniform(0.5, 1.5, matrix.shape)
+            return cp.where(mask, matrix * scale, matrix)
             
         network.weights1 = apply_mutation(network.weights1)
         network.bias1 = apply_mutation(network.bias1)
@@ -267,8 +272,8 @@ class GeneticAlgorithm:
         
         # Fill remaining 90% by breeding random elite parents and mutating offspring
         while len(new_population) < self.population_size:
-            p1 = np.random.choice(elites)
-            p2 = np.random.choice(elites)
+            p1 = random.choice(elites)
+            p2 = random.choice(elites)
             
             child = self.breed(p1, p2)
             self.mutate(child)
