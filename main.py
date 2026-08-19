@@ -32,6 +32,7 @@ import cv2
 import numpy as np
 import cupy as cp
 import random
+import multiprocessing as mp
 
 
 # ── Environment Setup ────────────────────────────────────────────────────────
@@ -55,6 +56,62 @@ def make_env():
     env = JoypadSpace(env, SIMPLE_MOVEMENT)
 
     return env
+
+
+def env_worker(conn):
+    """Worker process that runs a single Mario emulator."""
+    env = make_env()
+    while True:
+        try:
+            msg = conn.recv()
+            if msg[0] == 'reset':
+                env.reset()
+                conn.send(extract_vision_grid(env))
+            elif msg[0] == 'step':
+                action = msg[1]
+                state, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
+                conn.send((extract_vision_grid(env), done, info))
+            elif msg[0] == 'close':
+                env.close()
+                break
+        except Exception:
+            break
+
+
+class ParallelEnvManager:
+    """Manages 16 parallel Mario emulators running on separate CPU cores."""
+    def __init__(self, num_envs=16):
+        self.num_envs = num_envs
+        self.parents = []
+        self.processes = []
+        for _ in range(num_envs):
+            p_conn, c_conn = mp.Pipe()
+            self.parents.append(p_conn)
+            p = mp.Process(target=env_worker, args=(c_conn,))
+            p.daemon = True
+            p.start()
+            self.processes.append(p)
+            
+    def reset(self):
+        for p in self.parents:
+            p.send(('reset',))
+        return np.array([p.recv() for p in self.parents])
+        
+    def step(self, actions):
+        for p, a in zip(self.parents, actions):
+            p.send(('step', a))
+        results = [p.recv() for p in self.parents]
+        obs = np.array([r[0] for r in results])
+        dones = np.array([r[1] for r in results])
+        infos = [r[2] for r in results]
+        return obs, dones, infos
+        
+    def close(self):
+        for p in self.parents:
+            p.send(('close',))
+        for p in self.processes:
+            p.join()
 
 
 # ── Data Inspection Helper ───────────────────────────────────────────────────
@@ -194,72 +251,64 @@ class GeneticAlgorithm:
         # Generate initial population with random weights
         self.population = [NeuralNet() for _ in range(population_size)]
         
-    def evaluate_fitness(self, network, env):
-        env.reset()
-        done = False
-        
-        max_x_pos = 0
-        frames_since_progress = 0
-        
-        vision_flat = extract_vision_grid(env)
-        
-        while not done:
-            action = network.predict(vision_flat)
-            state, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-            
-            vision_flat = extract_vision_grid(env)
-            
-            current_x = info.get('x_pos', 0)
-            if current_x > max_x_pos:
-                max_x_pos = current_x
-                frames_since_progress = 0
-            else:
-                frames_since_progress += 1
-                
-            # Timeout feature: Break if stuck for 50 frames
-            if frames_since_progress >= 50:
-                break
-                
-        return max_x_pos
-
-    def breed(self, parent1, parent2):
-        child = NeuralNet()
-        
-        # 50% chance to inherit from parent 1 or 2
-        mask_w1 = cp.random.rand(*child.weights1.shape) > 0.5
-        child.weights1 = cp.where(mask_w1, parent1.weights1, parent2.weights1)
-        
-        mask_b1 = cp.random.rand(*child.bias1.shape) > 0.5
-        child.bias1 = cp.where(mask_b1, parent1.bias1, parent2.bias1)
-        
-        mask_w2 = cp.random.rand(*child.weights2.shape) > 0.5
-        child.weights2 = cp.where(mask_w2, parent1.weights2, parent2.weights2)
-        
-        mask_b2 = cp.random.rand(*child.bias2.shape) > 0.5
-        child.bias2 = cp.where(mask_b2, parent1.bias2, parent2.bias2)
-        
-        return child
-        
-    def mutate(self, network, mutation_rate=0.05):
-        # 5% chance to multiply weight/bias by random factor between 0.5 and 1.5
-        def apply_mutation(matrix):
-            mask = cp.random.rand(*matrix.shape) < mutation_rate
-            scale = cp.random.uniform(0.5, 1.5, matrix.shape)
-            return cp.where(mask, matrix * scale, matrix)
-            
-        network.weights1 = apply_mutation(network.weights1)
-        network.bias1 = apply_mutation(network.bias1)
-        network.weights2 = apply_mutation(network.weights2)
-        network.bias2 = apply_mutation(network.bias2)
-
-    def evolve(self, env):
-        # Evaluate fitness for the entire population
+    def evolve(self, env_manager):
+        batch_size = env_manager.num_envs
         fitness_scores = []
-        for network in self.population:
-            score = self.evaluate_fitness(network, env)
-            fitness_scores.append((score, network))
+        
+        # Process the population in batches (e.g., 16 at a time)
+        for i in range(0, self.population_size, batch_size):
+            batch_networks = self.population[i:i+batch_size]
+            actual_batch = len(batch_networks)
             
+            # Pad batch to keep tensor size constant if population isn't divisible by batch_size
+            eval_networks = batch_networks + [batch_networks[0]] * (batch_size - actual_batch)
+            
+            # Stack weights for explosive batched CuPy processing
+            w1 = cp.stack([n.weights1 for n in eval_networks]) # Shape: (16, 256, 18)
+            b1 = cp.stack([n.bias1 for n in eval_networks]).reshape(batch_size, 1, 18)
+            w2 = cp.stack([n.weights2 for n in eval_networks]) # Shape: (16, 18, 7)
+            b2 = cp.stack([n.bias2 for n in eval_networks]).reshape(batch_size, 1, 7)
+            
+            obs = env_manager.reset() # (16, 256) array of flat grids
+            
+            active = np.ones(batch_size, dtype=bool)
+            max_x = np.zeros(batch_size)
+            frames_stuck = np.zeros(batch_size)
+            
+            while active.any():
+                # --- GPU BATCHED INFERENCE ---
+                # Compute 16 neural networks instantly in one matrix multiplication
+                obs_gpu = cp.array(obs).reshape(batch_size, 1, 256)
+                z1 = cp.matmul(obs_gpu, w1) + b1
+                a1 = cp.maximum(0, z1)
+                z2 = cp.matmul(a1, w2) + b2
+                actions = cp.argmax(z2, axis=2).flatten().get()
+                
+                # Force NOOP on inactive envs so they don't move
+                actions[~active] = 0
+                
+                # Step all 16 parallel CPU emulators
+                next_obs, dones, infos = env_manager.step(actions)
+                
+                # Check fitness and timeouts for all 16 agents
+                for j in range(batch_size):
+                    if active[j]:
+                        curr_x = infos[j].get('x_pos', 0)
+                        if curr_x > max_x[j]:
+                            max_x[j] = curr_x
+                            frames_stuck[j] = 0
+                        else:
+                            frames_stuck[j] += 1
+                            
+                        if dones[j] or frames_stuck[j] >= 50:
+                            active[j] = False
+                            
+                obs = next_obs
+                
+            # Record actual batch scores
+            for j in range(actual_batch):
+                fitness_scores.append((max_x[j], batch_networks[j]))
+                
         # Sort descending by fitness
         fitness_scores.sort(key=lambda x: x[0], reverse=True)
         best_fitness = fitness_scores[0][0]
@@ -339,22 +388,29 @@ def watch_agent(network, env):
 
 
 def run():
-    print("[Phase 4]  Neuroevolution Training Started")
+    print("[Phase 4]  Neuroevolution Training Started (16 Parallel Workers)")
     
-    env = make_env()
+    # Manager for batched headless training (Uses all 16 Ryzen threads)
+    env_manager = ParallelEnvManager(num_envs=16)
+    
+    # Single environment for visual replay
+    visual_env = make_env()
+    
     ga = GeneticAlgorithm(population_size=100)
     
     for generation in range(1, 501):
-        best_fitness = ga.evolve(env)
+        best_fitness = ga.evolve(env_manager)
         print(f"Generation {generation:3d} | Best Fitness (Max X-Pos): {best_fitness}")
         
         # Show the best agent from this generation playing!
         # (Press ESC to skip the replay and continue training)
-        watch_agent(ga.population[0], env)
+        watch_agent(ga.population[0], visual_env)
         
-    env.close()
+    env_manager.close()
+    visual_env.close()
 
 # ── Entry Point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    mp.freeze_support() # Required for multiprocessing on Windows
     run()
