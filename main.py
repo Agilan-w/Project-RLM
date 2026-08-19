@@ -348,8 +348,11 @@ def run():
         best_fitness = ga.evolve(env)
         print(f"Generation {generation:3d} | Best Fitness (Max X-Pos): {best_fitness}")
         
+        # Show the best agent from this generation playing!
+        # (Press ESC to skip the replay and continue training)
+        watch_agent(ga.population[0], env)
+        
     env.close()
-
 
 # ── Entry Point ──────────────────────────────────────────────────────────────
 
