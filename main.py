@@ -33,6 +33,7 @@ import numpy as np
 import cupy as cp
 import random
 import multiprocessing as mp
+import os
 
 
 # ── Environment Setup ────────────────────────────────────────────────────────
@@ -252,6 +253,22 @@ class NeuralNet:
         
         # Return the index (0-6) of the highest output score as a standard int
         return int(cp.argmax(z2).get())
+        
+    def get_weights(self):
+        """Returns the weights as standard NumPy arrays for saving."""
+        return {
+            'w1': self.weights1.get(),
+            'b1': self.bias1.get(),
+            'w2': self.weights2.get(),
+            'b2': self.bias2.get()
+        }
+        
+    def set_weights(self, weights_dict):
+        """Loads weights from standard NumPy arrays onto the GPU."""
+        self.weights1 = cp.array(weights_dict['w1'])
+        self.bias1 = cp.array(weights_dict['b1'])
+        self.weights2 = cp.array(weights_dict['w2'])
+        self.bias2 = cp.array(weights_dict['b2'])
 
 
 # ── Genetic Algorithm (Phase 4) ──────────────────────────────────────────────
@@ -261,6 +278,33 @@ class GeneticAlgorithm:
         self.population_size = population_size
         # Generate initial population with random weights
         self.population = [NeuralNet() for _ in range(population_size)]
+        
+    def save_checkpoint(self, filepath, generation):
+        """Saves the entire population and current generation to an .npz file."""
+        checkpoint_data = {'generation': generation, 'population_size': self.population_size}
+        for i, net in enumerate(self.population):
+            weights = net.get_weights()
+            for k, v in weights.items():
+                checkpoint_data[f'net_{i}_{k}'] = v
+        np.savez_compressed(filepath, **checkpoint_data)
+        
+    def load_checkpoint(self, filepath):
+        """Loads the population and returns the next generation number."""
+        data = np.load(filepath)
+        gen = int(data['generation'])
+        self.population_size = int(data['population_size'])
+        self.population = []
+        for i in range(self.population_size):
+            net = NeuralNet()
+            weights = {
+                'w1': data[f'net_{i}_w1'],
+                'b1': data[f'net_{i}_b1'],
+                'w2': data[f'net_{i}_w2'],
+                'b2': data[f'net_{i}_b2']
+            }
+            net.set_weights(weights)
+            self.population.append(net)
+        return gen + 1
         
     def breed(self, parent1, parent2):
         child = NeuralNet()
@@ -439,9 +483,20 @@ def run():
     
     ga = GeneticAlgorithm(population_size=100)
     
-    for generation in range(1, 501):
+    checkpoint_file = "mario_checkpoint.npz"
+    start_generation = 1
+    
+    if os.path.exists(checkpoint_file):
+        print(f"[*] Found checkpoint file '{checkpoint_file}'. Loading...")
+        start_generation = ga.load_checkpoint(checkpoint_file)
+        print(f"[*] Resuming from Generation {start_generation}")
+    
+    for generation in range(start_generation, 501):
         best_fitness = ga.evolve(env_manager)
         print(f"Generation {generation:3d} | Best Fitness (Max X-Pos): {best_fitness}")
+        
+        # Save checkpoint at the end of each generation
+        ga.save_checkpoint(checkpoint_file, generation)
         
         # Show the best agent from this generation playing!
         # (Press ESC to skip the replay and continue training)
