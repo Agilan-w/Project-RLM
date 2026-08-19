@@ -61,21 +61,32 @@ def make_env():
 def env_worker(conn):
     """Worker process that runs a single Mario emulator."""
     env = make_env()
+    done = False
+    last_obs = None
+    last_info = {}
     while True:
         try:
             msg = conn.recv()
             if msg[0] == 'reset':
                 env.reset()
-                conn.send(extract_vision_grid(env))
+                done = False
+                last_obs = extract_vision_grid(env)
+                last_info = {}
+                conn.send(last_obs)
             elif msg[0] == 'step':
-                action = msg[1]
-                state, reward, terminated, truncated, info = env.step(action)
-                done = terminated or truncated
-                conn.send((extract_vision_grid(env), done, info))
+                if not done:
+                    action = msg[1]
+                    state, reward, terminated, truncated, info = env.step(action)
+                    done = terminated or truncated
+                    last_obs = extract_vision_grid(env)
+                    last_info = info
+                conn.send((last_obs, done, last_info))
             elif msg[0] == 'close':
                 env.close()
                 break
-        except Exception:
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
             break
 
 
@@ -251,6 +262,36 @@ class GeneticAlgorithm:
         # Generate initial population with random weights
         self.population = [NeuralNet() for _ in range(population_size)]
         
+    def breed(self, parent1, parent2):
+        child = NeuralNet()
+        
+        # 50% chance to inherit from parent 1 or 2
+        mask_w1 = cp.random.rand(*child.weights1.shape) > 0.5
+        child.weights1 = cp.where(mask_w1, parent1.weights1, parent2.weights1)
+        
+        mask_b1 = cp.random.rand(*child.bias1.shape) > 0.5
+        child.bias1 = cp.where(mask_b1, parent1.bias1, parent2.bias1)
+        
+        mask_w2 = cp.random.rand(*child.weights2.shape) > 0.5
+        child.weights2 = cp.where(mask_w2, parent1.weights2, parent2.weights2)
+        
+        mask_b2 = cp.random.rand(*child.bias2.shape) > 0.5
+        child.bias2 = cp.where(mask_b2, parent1.bias2, parent2.bias2)
+        
+        return child
+        
+    def mutate(self, network, mutation_rate=0.05):
+        # 5% chance to multiply weight/bias by random factor between 0.5 and 1.5
+        def apply_mutation(matrix):
+            mask = cp.random.rand(*matrix.shape) < mutation_rate
+            scale = cp.random.uniform(0.5, 1.5, matrix.shape)
+            return cp.where(mask, matrix * scale, matrix)
+            
+        network.weights1 = apply_mutation(network.weights1)
+        network.bias1 = apply_mutation(network.bias1)
+        network.weights2 = apply_mutation(network.weights2)
+        network.bias2 = apply_mutation(network.bias2)
+
     def evolve(self, env_manager):
         batch_size = env_manager.num_envs
         fitness_scores = []
@@ -314,7 +355,7 @@ class GeneticAlgorithm:
         best_fitness = fitness_scores[0][0]
         
         # Elitism: keep top 10% exactly as they are
-        elite_count = int(self.population_size * 0.1)
+        elite_count = max(1, int(self.population_size * 0.1))
         elites = [item[1] for item in fitness_scores[:elite_count]]
         
         new_population = list(elites)
