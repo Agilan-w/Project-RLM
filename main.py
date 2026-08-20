@@ -34,9 +34,28 @@ import cupy as cp
 import random
 import multiprocessing as mp
 import os
+import gym
 
 
 # ── Environment Setup ────────────────────────────────────────────────────────
+
+class FrameSkipEnv(gym.Wrapper):
+    """Skips frames to run the emulator faster. AI decides once every N frames."""
+    def __init__(self, env, skip=4):
+        super().__init__(env)
+        self._skip = skip
+        
+    def step(self, action):
+        total_reward = 0.0
+        done = False
+        for _ in range(self._skip):
+            obs, reward, terminated, truncated, info = self.env.step(action)
+            total_reward += reward
+            done = terminated or truncated
+            if done:
+                break
+        return obs, total_reward, terminated, truncated, info
+
 
 def make_env():
     """
@@ -48,12 +67,12 @@ def make_env():
         The Mario environment with a 7-action discrete action space.
     """
     # Create the raw NES environment for World 1-1.
-    # The observation is an (240, 256, 3) RGB numpy array — a raw frame
-    # from the NES PPU at 256×240 resolution.
     env = gym_super_mario_bros.make('SuperMarioBros-1-1-v0', render_mode='rgb_array')
 
+    # Fast-forward time to vastly speed up training and decision making
+    env = FrameSkipEnv(env, skip=4)
+
     # Wrap the controller so the action space shrinks from 256 → 7.
-    # This makes learning dramatically easier for our neural network later.
     env = JoypadSpace(env, SIMPLE_MOVEMENT)
 
     return env
@@ -65,13 +84,16 @@ def env_worker(conn):
     done = False
     last_obs = None
     last_info = {}
+    last_x, last_y = 40, 79
     while True:
         try:
             msg = conn.recv()
             if msg[0] == 'reset':
                 env.reset()
                 done = False
+                last_x, last_y = 40, 79
                 last_obs = extract_vision_grid(env)
+                last_obs = np.append(last_obs, [0, 0])
                 last_info = {}
                 conn.send(last_obs)
             elif msg[0] == 'step':
@@ -79,7 +101,15 @@ def env_worker(conn):
                     action = msg[1]
                     state, reward, terminated, truncated, info = env.step(action)
                     done = terminated or truncated
+                    
+                    curr_x = info.get('x_pos', 40)
+                    curr_y = info.get('y_pos', 79)
+                    dx = curr_x - last_x
+                    dy = curr_y - last_y
+                    last_x, last_y = curr_x, curr_y
+                    
                     last_obs = extract_vision_grid(env)
+                    last_obs = np.append(last_obs, [dx, dy])
                     last_info = info
                 conn.send((last_obs, done, last_info))
             elif msg[0] == 'close':
@@ -228,7 +258,7 @@ class NeuralNet:
     A simple pure-CuPy Feedforward Neural Network.
     No PyTorch, TensorFlow, or Keras.
     """
-    def __init__(self, input_size=256, hidden_size=18, output_size=7):
+    def __init__(self, input_size=258, hidden_size=18, output_size=7):
         # Initialize weights and biases with random values between -1 and 1
         self.weights1 = cp.random.uniform(-1, 1, (input_size, hidden_size))
         self.bias1 = cp.random.uniform(-1, 1, hidden_size)
@@ -296,8 +326,14 @@ class GeneticAlgorithm:
         self.population = []
         for i in range(self.population_size):
             net = NeuralNet()
+            
+            w1 = data[f'net_{i}_w1']
+            # Backward compatibility: Upgrade old 256-input brains to 258-input brains
+            if w1.shape[0] == 256:
+                w1 = np.pad(w1, ((0, 2), (0, 0)), 'constant', constant_values=0)
+                
             weights = {
-                'w1': data[f'net_{i}_w1'],
+                'w1': w1,
                 'b1': data[f'net_{i}_b1'],
                 'w2': data[f'net_{i}_w2'],
                 'b2': data[f'net_{i}_b2']
@@ -354,7 +390,7 @@ class GeneticAlgorithm:
             w2 = cp.stack([n.weights2 for n in eval_networks]) # Shape: (16, 18, 7)
             b2 = cp.stack([n.bias2 for n in eval_networks]).reshape(batch_size, 1, 7)
             
-            obs = env_manager.reset() # (16, 256) array of flat grids
+            obs = env_manager.reset() # (16, 258) array of flat grids + velocity
             
             active = np.ones(batch_size, dtype=bool)
             max_x = np.zeros(batch_size)
@@ -363,7 +399,7 @@ class GeneticAlgorithm:
             while active.any():
                 # --- GPU BATCHED INFERENCE ---
                 # Compute 16 neural networks instantly in one matrix multiplication
-                obs_gpu = cp.array(obs).reshape(batch_size, 1, 256)
+                obs_gpu = cp.array(obs).reshape(batch_size, 1, 258)
                 z1 = cp.matmul(obs_gpu, w1) + b1
                 a1 = cp.maximum(0, z1)
                 z2 = cp.matmul(a1, w2) + b2
@@ -426,18 +462,27 @@ def watch_agent(network, env):
     """
     env.reset()
     done = False
+    last_x, last_y = 40, 79
     vision_flat = extract_vision_grid(env)
+    vision_flat_258 = np.append(vision_flat, [0, 0])
     
     while not done:
-        action = network.predict(vision_flat)
+        action = network.predict(vision_flat_258)
         state, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
+        
+        curr_x = info.get('x_pos', 40)
+        curr_y = info.get('y_pos', 79)
+        dx = curr_x - last_x
+        dy = curr_y - last_y
+        last_x, last_y = curr_x, curr_y
 
         mario_frame = env.render()
         mario_bgr = cv2.cvtColor(mario_frame, cv2.COLOR_RGB2BGR)
         
         vision_flat = extract_vision_grid(env)
         vision_2d = vision_flat.reshape((16, 16))
+        vision_flat_258 = np.append(vision_flat, [dx, dy])
         
         grid_size = 512
         grid_canvas = np.zeros((grid_size, grid_size, 3), dtype=np.uint8)
