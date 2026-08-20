@@ -439,7 +439,7 @@ class GeneticAlgorithm:
                         else:
                             frames_stuck[j] += 1
                             
-                        if dones[j] or frames_stuck[j] >= 200:
+                        if dones[j] or frames_stuck[j] >= 75:
                             active[j] = False
                             
                 obs = next_obs
@@ -558,7 +558,7 @@ def run():
         start_generation = ga.load_checkpoint(checkpoint_file)
         print(f"[*] Resuming from Generation {start_generation}")
     
-    for generation in range(start_generation, 2001):
+    for generation in range(start_generation, 501):
         best_fitness = ga.evolve(env_manager)
         print(f"Generation {generation:4d} | Best Fitness: {best_fitness:.1f}")
         
