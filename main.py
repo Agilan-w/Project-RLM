@@ -34,12 +34,12 @@ import cupy as cp
 import random
 import multiprocessing as mp
 import os
-import gym
+import gymnasium
 
 
 # ── Environment Setup ────────────────────────────────────────────────────────
 
-class FrameSkipEnv(gym.Wrapper):
+class FrameSkipEnv(gymnasium.Wrapper):
     """Skips frames to run the emulator faster. AI decides once every N frames."""
     def __init__(self, env, skip=4):
         super().__init__(env)
@@ -258,13 +258,15 @@ class NeuralNet:
     A simple pure-CuPy Feedforward Neural Network.
     No PyTorch, TensorFlow, or Keras.
     """
-    def __init__(self, input_size=258, hidden_size=18, output_size=7):
-        # Initialize weights and biases with random values between -1 and 1
-        self.weights1 = cp.random.uniform(-1, 1, (input_size, hidden_size))
-        self.bias1 = cp.random.uniform(-1, 1, hidden_size)
+    def __init__(self, input_size=258, hidden_size=64, output_size=7):
+        # Xavier initialization for better training convergence
+        scale1 = np.sqrt(2.0 / input_size)
+        self.weights1 = cp.random.normal(0, scale1, (input_size, hidden_size))
+        self.bias1 = cp.zeros(hidden_size)
         
-        self.weights2 = cp.random.uniform(-1, 1, (hidden_size, output_size))
-        self.bias2 = cp.random.uniform(-1, 1, output_size)
+        scale2 = np.sqrt(2.0 / hidden_size)
+        self.weights2 = cp.random.normal(0, scale2, (hidden_size, output_size))
+        self.bias2 = cp.zeros(output_size)
         
     def relu(self, x):
         # ReLU activation function: max(0, x)
@@ -323,17 +325,23 @@ class GeneticAlgorithm:
         data = np.load(filepath)
         gen = int(data['generation'])
         self.population_size = int(data['population_size'])
+        
+        # Check architecture compatibility
+        w1_shape = data['net_0_w1'].shape
+        expected_net = NeuralNet()
+        expected_shape = expected_net.weights1.get().shape
+        
+        if w1_shape != expected_shape:
+            print(f"[!] Checkpoint architecture mismatch: saved={w1_shape}, current={expected_shape}")
+            print(f"[!] Starting fresh with new architecture. Old checkpoint preserved as backup.")
+            self.population = [NeuralNet() for _ in range(self.population_size)]
+            return 1  # Start from generation 1
+        
         self.population = []
         for i in range(self.population_size):
             net = NeuralNet()
-            
-            w1 = data[f'net_{i}_w1']
-            # Backward compatibility: Upgrade old 256-input brains to 258-input brains
-            if w1.shape[0] == 256:
-                w1 = np.pad(w1, ((0, 2), (0, 0)), 'constant', constant_values=0)
-                
             weights = {
-                'w1': w1,
+                'w1': data[f'net_{i}_w1'],
                 'b1': data[f'net_{i}_b1'],
                 'w2': data[f'net_{i}_w2'],
                 'b2': data[f'net_{i}_b2']
@@ -360,17 +368,23 @@ class GeneticAlgorithm:
         
         return child
         
-    def mutate(self, network, mutation_rate=0.05):
-        # 5% chance to multiply weight/bias by random factor between 0.5 and 1.5
+    def mutate(self, network, mutation_rate=0.1):
+        # Gaussian noise mutation: every weight has a 10% chance of being nudged
         def apply_mutation(matrix):
             mask = cp.random.rand(*matrix.shape) < mutation_rate
-            scale = cp.random.uniform(0.5, 1.5, matrix.shape)
-            return cp.where(mask, matrix * scale, matrix)
+            noise = cp.random.normal(0, 0.3, matrix.shape)
+            return matrix + mask * noise
             
         network.weights1 = apply_mutation(network.weights1)
         network.bias1 = apply_mutation(network.bias1)
         network.weights2 = apply_mutation(network.weights2)
         network.bias2 = apply_mutation(network.bias2)
+    
+    def tournament_select(self, fitness_scores, k=3):
+        """Pick k random agents and return the best one."""
+        contestants = random.sample(fitness_scores, k)
+        contestants.sort(key=lambda x: x[0], reverse=True)
+        return contestants[0][1]
 
     def evolve(self, env_manager):
         batch_size = env_manager.num_envs
@@ -385,21 +399,24 @@ class GeneticAlgorithm:
             eval_networks = batch_networks + [batch_networks[0]] * (batch_size - actual_batch)
             
             # Stack weights for explosive batched CuPy processing
-            w1 = cp.stack([n.weights1 for n in eval_networks]) # Shape: (16, 256, 18)
-            b1 = cp.stack([n.bias1 for n in eval_networks]).reshape(batch_size, 1, 18)
-            w2 = cp.stack([n.weights2 for n in eval_networks]) # Shape: (16, 18, 7)
-            b2 = cp.stack([n.bias2 for n in eval_networks]).reshape(batch_size, 1, 7)
+            hidden_size = eval_networks[0].weights1.shape[1]
+            output_size = eval_networks[0].weights2.shape[1]
+            w1 = cp.stack([n.weights1 for n in eval_networks]) # Shape: (16, 258, 64)
+            b1 = cp.stack([n.bias1 for n in eval_networks]).reshape(batch_size, 1, hidden_size)
+            w2 = cp.stack([n.weights2 for n in eval_networks]) # Shape: (16, 64, 7)
+            b2 = cp.stack([n.bias2 for n in eval_networks]).reshape(batch_size, 1, output_size)
             
             obs = env_manager.reset() # (16, 258) array of flat grids + velocity
             
             active = np.ones(batch_size, dtype=bool)
             max_x = np.zeros(batch_size)
+            frames_alive = np.zeros(batch_size)
             frames_stuck = np.zeros(batch_size)
             
             while active.any():
                 # --- GPU BATCHED INFERENCE ---
                 # Compute 16 neural networks instantly in one matrix multiplication
-                obs_gpu = cp.array(obs).reshape(batch_size, 1, 258)
+                obs_gpu = cp.array(obs, dtype=cp.float32).reshape(batch_size, 1, 258)
                 z1 = cp.matmul(obs_gpu, w1) + b1
                 a1 = cp.maximum(0, z1)
                 z2 = cp.matmul(a1, w2) + b2
@@ -414,6 +431,7 @@ class GeneticAlgorithm:
                 # Check fitness and timeouts for all 16 agents
                 for j in range(batch_size):
                     if active[j]:
+                        frames_alive[j] += 1
                         curr_x = infos[j].get('x_pos', 0)
                         if curr_x > max_x[j]:
                             max_x[j] = curr_x
@@ -421,14 +439,17 @@ class GeneticAlgorithm:
                         else:
                             frames_stuck[j] += 1
                             
-                        if dones[j] or frames_stuck[j] >= 50:
+                        if dones[j] or frames_stuck[j] >= 200:
                             active[j] = False
                             
                 obs = next_obs
                 
-            # Record actual batch scores
+            # Record actual batch scores with speed-based fitness
             for j in range(actual_batch):
-                fitness_scores.append((max_x[j], batch_networks[j]))
+                dist = max_x[j]
+                speed_bonus = (dist / max(frames_alive[j], 1)) * 100
+                fitness = dist + speed_bonus
+                fitness_scores.append((fitness, batch_networks[j]))
                 
         # Sort descending by fitness
         fitness_scores.sort(key=lambda x: x[0], reverse=True)
@@ -440,10 +461,10 @@ class GeneticAlgorithm:
         
         new_population = list(elites)
         
-        # Fill remaining 90% by breeding random elite parents and mutating offspring
+        # Fill remaining 90% via tournament selection + crossover + mutation
         while len(new_population) < self.population_size:
-            p1 = random.choice(elites)
-            p2 = random.choice(elites)
+            p1 = self.tournament_select(fitness_scores)
+            p2 = self.tournament_select(fitness_scores)
             
             child = self.breed(p1, p2)
             self.mutate(child)
@@ -518,7 +539,8 @@ def watch_agent(network, env):
 
 
 def run():
-    print("[Phase 4]  Neuroevolution Training Started (16 Parallel Workers)")
+    print("[Phase 5]  Neuroevolution v2 Training Started (16 Parallel Workers)")
+    print("           Hidden=64 | Gaussian Mutation | Tournament Selection | Speed Fitness")
     
     # Manager for batched headless training (Uses all 16 Ryzen threads)
     env_manager = ParallelEnvManager(num_envs=16)
@@ -536,16 +558,17 @@ def run():
         start_generation = ga.load_checkpoint(checkpoint_file)
         print(f"[*] Resuming from Generation {start_generation}")
     
-    for generation in range(start_generation, 501):
+    for generation in range(start_generation, 2001):
         best_fitness = ga.evolve(env_manager)
-        print(f"Generation {generation:3d} | Best Fitness (Max X-Pos): {best_fitness}")
+        print(f"Generation {generation:4d} | Best Fitness: {best_fitness:.1f}")
         
         # Save checkpoint at the end of each generation
         ga.save_checkpoint(checkpoint_file, generation)
         
-        # Show the best agent from this generation playing!
-        # (Press ESC to skip the replay and continue training)
-        watch_agent(ga.population[0], visual_env)
+        # Show the best agent playing every 10 generations (press ESC to skip)
+        if generation % 10 == 0:
+            print(f"  >> Showing best agent replay (Gen {generation})...")
+            watch_agent(ga.population[0], visual_env)
         
     env_manager.close()
     visual_env.close()
