@@ -1,8 +1,8 @@
-# Project-RLM: Super Mario Bros Neuroevolution AI 🍄🎮
+# Project-RLM: Super Mario Bros Neuroevolution AI
 
 A custom Neuroevolution and Genetic Algorithm AI built from scratch using pure NumPy to play **Super Mario Bros (NES)**.
 
-## 🌟 Overview
+## Overview
 
 This project evolves a population of neural networks to navigate levels in *Super Mario Bros (World 1-1)* without relying on heavy deep learning frameworks like PyTorch or TensorFlow.
 
@@ -23,7 +23,7 @@ This project evolves a population of neural networks to navigate levels in *Supe
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Prerequisites
 - Python 3.10 - 3.12+ (Virtual environment recommended)
