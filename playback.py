@@ -50,30 +50,31 @@ def record_champion():
     
     print("Recording started. Press ESC to stop early.")
     
-    action = 0
-    frame_counter = 0
+    # Initial prediction (matches training reset state)
+    vision_flat = extract_vision_grid(env)
+    vision_flat_258 = np.append(vision_flat, [0, 0])
+    action = champion_net.predict(vision_flat_258)
+    vision_2d = vision_flat.reshape((16, 16))
+    
+    frame_counter = 1
     
     while not done:
-        # The AI was trained with a frame skip of 4.
-        # To replicate its exact behavior but get smooth video, we only ask 
-        # the neural network for a new decision every 4th frame, and hold the 
-        # button down for the intermediate frames.
-        if frame_counter % 4 == 0:
-            vision_flat = extract_vision_grid(env)
-            vision_flat_258 = np.append(vision_flat, [dx, dy])
-            action = champion_net.predict(vision_flat_258)
-            vision_2d = vision_flat.reshape((16, 16))
-            
         state, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         
         curr_x = info.get('x_pos', 40)
         curr_y = info.get('y_pos', 79)
-        # Update velocities only when the AI evaluates (every 4 frames)
+        
+        # After completing 4 frames, evaluate the AI for the NEXT action
         if frame_counter % 4 == 0:
             dx = curr_x - last_x
             dy = curr_y - last_y
             last_x, last_y = curr_x, curr_y
+            
+            vision_flat = extract_vision_grid(env)
+            vision_flat_258 = np.append(vision_flat, [dx, dy])
+            action = champion_net.predict(vision_flat_258)
+            vision_2d = vision_flat.reshape((16, 16))
             
         frame_counter += 1
         
